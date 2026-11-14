@@ -23,7 +23,7 @@ func TestFakeOrderProperty(t *testing.T) {
 			at  time.Duration
 			seq int
 		}
-		var expect []want
+		expect := make([]want, 0, 30)
 		var got []int
 		live := map[int]Timer{}
 		seq := 0

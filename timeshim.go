@@ -30,7 +30,7 @@ type Timer interface {
 }
 
 // Real is the system clock.
-var Real Clock = realClock{}
+var Real Clock = realClock{} //nolint:gochecknoglobals // exported default clock, stateless
 
 type realClock struct{}
 

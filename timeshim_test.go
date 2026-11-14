@@ -33,7 +33,7 @@ func TestFake(t *testing.T) {
 	if Or(nil) != Real || Or(c) != c {
 		t.Error("Or")
 	}
-	if d := Real.Now().Sub(time.Now()); d > time.Second || d < -time.Second {
+	if d := -time.Until(Real.Now()); d > time.Second || d < -time.Second {
 		t.Error("Real.Now")
 	}
 }

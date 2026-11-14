@@ -1,0 +1,64 @@
+version: "2"
+
+linters:
+  default: all
+  disable:
+    # Formatting and naming style that gofmt and the code's idiom already
+    # settle: blank-line placement, short names in short scopes, the
+    # if err := f(); err != nil form, embedded-field spacing.
+    - wsl
+    - wsl_v5
+    - nlreturn
+    - varnamelen
+    - noinlineerr
+    - embeddedstructfieldcheck
+    - lll
+    # Zero values are ready to use; literals name only the fields they set.
+    - exhaustruct
+    - exhaustruct_v5
+    # Methods are ordered by topic, next to the code they serve.
+    - funcorder
+    # Deprecated, replaced by gomodguard_v2.
+    - gomodguard
+    # No import rules: the module has no dependencies.
+    - depguard
+    # The clock code is written out in one function where the lock is
+    # held, and the property tests spell out their steps.
+    - cyclop
+    # The tests use the package's unexported state, and the fake clock
+    # tests drive one clock from one goroutine.
+    - testpackage
+    - paralleltest
+    - tparallel
+    # The clock interfaces return the timers and contexts of their
+    # implementations; errors come from the context as they are.
+    - ireturn
+    - wrapcheck
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        # Checked on its own, as fieldalignment; what remains are
+        # pointer-byte reports, for which fields keep their order of
+        # meaning.
+        - fieldalignment
+    exhaustive:
+      default-signifies-exhaustive: true
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+  exclusions:
+    rules:
+      # Tests keep shared fixtures in package variables, seed a
+      # deterministic generator and run the go tool by name.
+      - path: _test\.go
+        linters:
+          - gochecknoglobals
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G404|G204"
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

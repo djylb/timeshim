@@ -222,7 +222,7 @@ func WithTimeout(ctx context.Context, c Clock, d time.Duration) (context.Context
 // deadlineCtx is a context that ends at a deadline of a clock other than
 // Real.
 type deadlineCtx struct {
-	parent   context.Context
+	parent   context.Context //nolint:containedctx // a context whose deadline follows a clock; the parent is what it wraps
 	deadline time.Time
 	done     chan struct{}
 
