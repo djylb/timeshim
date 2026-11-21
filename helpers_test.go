@@ -366,3 +366,44 @@ func TestChanTimerNonPositiveDelay(t *testing.T) {
 	}
 	<-After(c, 0)
 }
+
+// A ChanTimer that fires in an Advance delivers when the Advance ends;
+// Stop in between reports it pending and drops the value; a timer that a
+// function of the Advance sets still fires in it.
+func TestChanTimerDeliversAtEnd(t *testing.T) {
+	c := NewFake(epoch)
+	tm := NewTimer(c, time.Second)
+	var stop *ChanTimer
+	c.AfterFunc(2*time.Second, func() {
+		select {
+		case <-tm.C:
+			t.Error("value before the Advance ended")
+		default:
+		}
+		stop = NewTimer(c, time.Hour)
+		if !stop.Stop() {
+			t.Error("Stop of a pending timer")
+		}
+		stop = NewTimer(c, time.Second)
+	})
+	late := NewTimer(c, 3*time.Second)
+	c.AfterFunc(3*time.Second, func() {
+		if !late.Stop() {
+			t.Error("Stop of a fired, undelivered timer reported not pending")
+		}
+	})
+	c.Advance(10 * time.Second)
+	if v := <-tm.C; !v.Equal(epoch.Add(time.Second)) {
+		t.Fatalf("got %v", v)
+	}
+	select {
+	case <-late.C:
+		t.Fatal("value of a stopped timer")
+	default:
+	}
+	select {
+	case <-stop.C:
+	default:
+		t.Fatal("timer armed by a function did not fire in the Advance")
+	}
+}

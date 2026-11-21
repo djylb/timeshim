@@ -62,6 +62,7 @@ type chanState struct {
 	mu     sync.Mutex
 	c      chan time.Time
 	gen    uint64
+	queued bool // a send waits for the end of an Advance
 	clock  Clock
 	timer  Timer
 	period time.Duration // for a Ticker; 0 for a ChanTimer
@@ -82,10 +83,7 @@ func newChanState(c Clock, d, period time.Duration) *chanState {
 func (s *chanState) arm(d time.Duration) {
 	if d <= 0 && s.period == 0 {
 		s.timer = nil
-		select {
-		case s.c <- s.clock.Now():
-		default:
-		}
+		s.sendLocked(s.clock.Now())
 		return
 	}
 	s.timer = s.clock.AfterFunc(d, s.fire(s.gen))
@@ -99,13 +97,41 @@ func (s *chanState) fire(gen uint64) func() {
 		if s.gen != gen {
 			return
 		}
-		select {
-		case s.c <- s.clock.Now():
-		default: // a Ticker drops the tick a slow receiver missed
+		now := s.clock.Now()
+		if f, ok := s.clock.(sendDeferrer); ok {
+			s.queued = true
+			f.deferSend(func() { s.send(gen, now) })
+		} else {
+			s.sendLocked(now)
 		}
 		if s.period > 0 {
 			s.timer.Reset(s.period)
 		}
+	}
+}
+
+// sendDeferrer is a clock that makes channel sends at the end of its
+// Advance: Fake, also embedded in another clock.
+type sendDeferrer interface {
+	deferSend(send func())
+}
+
+// send makes the send of generation gen that a Fake deferred.
+func (s *chanState) send(gen uint64, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.gen != gen {
+		return
+	}
+	s.queued = false
+	s.sendLocked(now)
+}
+
+// sendLocked sends now unless a value waits; s.mu is held.
+func (s *chanState) sendLocked(now time.Time) {
+	select {
+	case s.c <- now:
+	default: // a Ticker drops the tick a slow receiver missed
 	}
 }
 
@@ -114,8 +140,8 @@ func (s *chanState) rearm(d time.Duration, period time.Duration) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gen++
-	pending := s.timer != nil && s.timer.Stop()
-	s.timer = nil
+	pending := s.timer != nil && s.timer.Stop() || s.queued
+	s.timer, s.queued = nil, false
 	select {
 	case <-s.c: // fired but not received: pending, as for time.Timer
 		pending = true

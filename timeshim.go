@@ -52,6 +52,7 @@ type Fake struct {
 	now    time.Time
 	timers []*fakeTimer
 	armed  chan struct{} // closed when a timer is armed; nil if none waits
+	sends  []func()      // channel sends of the running Advance, made at its end
 }
 
 // NewFake returns a Fake clock at t.
@@ -83,7 +84,10 @@ func (c *Fake) AfterFunc(d time.Duration, f func()) Timer {
 
 // Advance moves the clock d forward and calls, in order of their times and
 // outside the clock's lock, the functions that are due; a function may set
-// new timers, which are called too when due. Functions due at the same time
+// new timers, which are called too when due. The channels of a ChanTimer
+// or Ticker that fires receive its time when Advance ends, so that a
+// goroutine woken by one finds the clock at its new time, as after a jump,
+// and no timer it sets fires in the same Advance. Functions due at the same time
 // are called in the order they were armed by AfterFunc or Reset. Time never
 // goes back: a negative d panics, and of concurrent calls, each leaves the
 // clock at least where it took it.
@@ -155,7 +159,12 @@ func (c *Fake) run(end time.Time) {
 			if end.After(c.now) {
 				c.now = end
 			}
+			sends := c.sends
+			c.sends = nil
 			c.mu.Unlock()
+			for _, send := range sends {
+				send()
+			}
 			return
 		}
 		t := c.timers[i]
@@ -234,6 +243,14 @@ func (c *Fake) WaitDeadline(ctx context.Context, t time.Time) error {
 			return ctx.Err()
 		}
 	}
+}
+
+// deferSend makes send, the channel send of a timer or ticker that has
+// fired, at the end of the running Advance.
+func (c *Fake) deferSend(send func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sends = append(c.sends, send)
 }
 
 // arm adds t to the clock's list and wakes WaitPending; the clock's lock is

@@ -75,6 +75,11 @@ clk.Advance(time.Minute)
 - `Advance` runs the functions that come due in its own goroutine, in order
   of their deadlines, outside the clock's lock, so a function may call the
   clock again or arm new timers; those run in the same `Advance` when due.
+- The channel of a `ChanTimer` or `Ticker` that fires in an `Advance`
+  receives the timer's time when that `Advance` ends: a goroutine it wakes
+  finds the clock at its new time, as after a jump, and a timer that
+  goroutine sets does not fire in the same `Advance`, however it is
+  scheduled.
 - Equal deadlines fire in the order the timers were armed (`AfterFunc` or
   `Reset`).
 - Time never goes backwards: a negative `Advance` panics, and of concurrent
