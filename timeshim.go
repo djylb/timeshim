@@ -122,6 +122,18 @@ func (c *Fake) AdvanceToNext() (time.Time, bool) {
 	return at, true
 }
 
+// Next returns the earliest pending time, and false when no function is
+// pending.
+func (c *Fake) Next() (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	i := c.next(time.Time{}, false)
+	if i < 0 {
+		return time.Time{}, false
+	}
+	return c.timers[i].at, true
+}
+
 // Deadlines returns the times of the pending functions, earliest first.
 func (c *Fake) Deadlines() []time.Time {
 	c.mu.Lock()
@@ -183,6 +195,31 @@ func (c *Fake) WaitPending(ctx context.Context, n int) error {
 	for {
 		c.mu.Lock()
 		if len(c.timers) >= n {
+			c.mu.Unlock()
+			return nil
+		}
+		if c.armed == nil {
+			c.armed = make(chan struct{})
+		}
+		armed := c.armed
+		c.mu.Unlock()
+		select {
+		case <-armed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// WaitDeadline waits until a function is pending at exactly t, such as
+// once code under test has armed the one timer a test is about to pass,
+// and returns nil, or ctx's error if ctx ends first. Unlike WaitPending it
+// does not depend on how many other timers are pending. It does not move
+// the clock.
+func (c *Fake) WaitDeadline(ctx context.Context, t time.Time) error {
+	for {
+		c.mu.Lock()
+		if slices.ContainsFunc(c.timers, func(x *fakeTimer) bool { return x.at.Equal(t) }) {
 			c.mu.Unlock()
 			return nil
 		}

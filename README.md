@@ -65,8 +65,10 @@ clk.Advance(time.Minute)
 | `AdvanceTo(t)`         | moves forward to t; an earlier t does not move back  |
 | `AdvanceToNext()`      | jumps to the earliest pending time and fires it      |
 | `Pending()`            | counts the pending functions                         |
+| `Next()`               | reports the earliest pending time                    |
 | `Deadlines()`          | lists their times, earliest first                    |
 | `WaitPending(ctx, n)`  | waits until n functions are pending                  |
+| `WaitDeadline(ctx, t)` | waits until a function is pending at t               |
 
 ## Guarantees
 
@@ -84,7 +86,9 @@ clk.Advance(time.Minute)
   stale value is received, and a ticker drops ticks a slow receiver misses.
 - On a `Fake`, a delay of zero or less is due at once: the function runs in
   the next `Advance` (`Advance(0)` included), not in a goroutine of its own,
-  and `Deadlines` never reports a time before `Now`.
+  and `Deadlines` never reports a time before `Now`. A `ChanTimer` (or
+  `After`) with such a delay has its value ready at once, as with
+  `time.NewTimer`, since no function has to run.
 - The order holds within one `Advance`; concurrent `Advance` calls may run
   due functions at the same time in different goroutines.
 - `WithDeadline` on an ended parent, or with a past deadline, returns a

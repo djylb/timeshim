@@ -340,3 +340,29 @@ func TestFakeNonPositiveDelay(t *testing.T) {
 		t.Fatalf("n = %d", n)
 	}
 }
+
+func TestChanTimerNonPositiveDelay(t *testing.T) {
+	c := NewFake(epoch)
+	tm := NewTimer(c, 0)
+	select {
+	case v := <-tm.C:
+		if !v.Equal(epoch) {
+			t.Fatalf("got %v", v)
+		}
+	default:
+		t.Fatal("NewTimer(0) not ready")
+	}
+	if tm.Stop() || c.Pending() != 0 {
+		t.Fatal("received timer still pending")
+	}
+	tm.Reset(-time.Second)
+	if !tm.Stop() {
+		t.Fatal("unreceived value after Reset(<0) not pending")
+	}
+	select {
+	case <-tm.C:
+		t.Fatal("stale value after Stop")
+	default:
+	}
+	<-After(c, 0)
+}

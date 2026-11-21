@@ -70,9 +70,25 @@ type chanState struct {
 func newChanState(c Clock, d, period time.Duration) *chanState {
 	s := &chanState{c: make(chan time.Time, 1), clock: c, period: period}
 	s.mu.Lock()
-	s.timer = c.AfterFunc(d, s.fire(0))
+	s.arm(d)
 	s.mu.Unlock()
 	return s
+}
+
+// arm makes the current generation fire after d; s.mu is held. A timer
+// (not a Ticker) with d <= 0 has its value ready at once, as with
+// time.NewTimer: there is no function to run, so nothing waits for an
+// Advance.
+func (s *chanState) arm(d time.Duration) {
+	if d <= 0 && s.period == 0 {
+		s.timer = nil
+		select {
+		case s.c <- s.clock.Now():
+		default:
+		}
+		return
+	}
+	s.timer = s.clock.AfterFunc(d, s.fire(s.gen))
 }
 
 // fire returns the function of the timer of generation gen.
@@ -98,7 +114,8 @@ func (s *chanState) rearm(d time.Duration, period time.Duration) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gen++
-	pending := s.timer.Stop()
+	pending := s.timer != nil && s.timer.Stop()
+	s.timer = nil
 	select {
 	case <-s.c: // fired but not received: pending, as for time.Timer
 		pending = true
@@ -106,13 +123,15 @@ func (s *chanState) rearm(d time.Duration, period time.Duration) bool {
 	}
 	if d > 0 || period == 0 && d >= 0 {
 		s.period = period
-		s.timer = s.clock.AfterFunc(d, s.fire(s.gen))
+		s.arm(d)
 	}
 	return pending
 }
 
 // NewTimer returns a timer that sends on its channel once d has passed on
-// c, as time.NewTimer. On Real it is a *time.Timer underneath.
+// c, as time.NewTimer. On Real it is a *time.Timer underneath. On other
+// clocks a d of zero or less has the value ready on C at once, as does
+// Reset with such a d.
 func NewTimer(c Clock, d time.Duration) *ChanTimer {
 	if _, ok := c.(realClock); ok {
 		t := time.NewTimer(d)

@@ -68,3 +68,28 @@ func TestFakeAdvanceNeverGoesBack(t *testing.T) {
 	}()
 	c.Advance(-1)
 }
+
+func TestFakeNextAndWaitDeadline(t *testing.T) {
+	c := NewFake(time.Unix(0, 0))
+	if _, ok := c.Next(); ok {
+		t.Fatal("Next on an empty clock")
+	}
+	at := c.Now().Add(2 * time.Second)
+	done := make(chan error, 1)
+	go func() { done <- c.WaitDeadline(context.Background(), at) }()
+	tm1 := c.AfterFunc(time.Second, func() {})
+	tm2 := c.AfterFunc(2*time.Second, func() {})
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := c.Next(); !ok || !n.Equal(c.Now().Add(time.Second)) {
+		t.Fatalf("Next() = %v, %v", n, ok)
+	}
+	tm1.Stop()
+	tm2.Stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := c.WaitDeadline(ctx, at); err == nil {
+		t.Fatal("WaitDeadline after cancel")
+	}
+}
