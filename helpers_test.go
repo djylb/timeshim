@@ -407,3 +407,40 @@ func TestChanTimerDeliversAtEnd(t *testing.T) {
 		t.Fatal("timer armed by a function did not fire in the Advance")
 	}
 }
+
+var (
+	errQueueTimeout = errors.New("queue timeout")
+	errParentGone   = errors.New("parent")
+)
+
+func TestWithDeadlineCause(t *testing.T) {
+	cause := errQueueTimeout
+	for _, clk := range []Clock{Real, NewFake(time.Unix(0, 0))} {
+		ctx, cancel := WithTimeoutCause(context.Background(), clk, time.Millisecond, cause)
+		if f, ok := clk.(*Fake); ok {
+			f.Advance(time.Second)
+		} else {
+			<-ctx.Done()
+		}
+		<-ctx.Done()
+		if !errors.Is(ctx.Err(), context.DeadlineExceeded) || !errors.Is(context.Cause(ctx), cause) {
+			t.Fatalf("%T: err %v cause %v", clk, ctx.Err(), context.Cause(ctx))
+		}
+		cancel()
+	}
+	fake := NewFake(time.Unix(0, 0))
+	ctx, cancel := WithTimeoutCause(context.Background(), fake, time.Hour, cause)
+	cancel()
+	if !errors.Is(ctx.Err(), context.Canceled) || errors.Is(context.Cause(ctx), cause) {
+		t.Fatalf("cancel: err %v cause %v", ctx.Err(), context.Cause(ctx))
+	}
+	parent, stop := context.WithCancelCause(context.Background())
+	parentCause := errParentGone
+	ctx, cancel = WithTimeoutCause(parent, fake, time.Hour, cause)
+	defer cancel()
+	stop(parentCause)
+	<-ctx.Done()
+	if !errors.Is(context.Cause(ctx), parentCause) {
+		t.Fatalf("parent cause %v", context.Cause(ctx))
+	}
+}

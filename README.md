@@ -39,6 +39,7 @@ functions that take a clock, with the names and semantics of `time`:
 | `NewTimer(c, d)`                | `time.NewTimer`                        |
 | `NewTicker(c, d)`               | `time.NewTicker`                       |
 | `WithDeadline`, `WithTimeout`   | `context.WithDeadline`, `WithTimeout`  |
+| `WithDeadlineCause`, `WithTimeoutCause` | `context.WithDeadlineCause`, `WithTimeoutCause` |
 
 On `Real` each of them calls the `time` or `context` function directly.
 On other clocks, timers and tickers are built on `AfterFunc` without a

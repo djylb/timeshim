@@ -259,6 +259,45 @@ func WithDeadline(ctx context.Context, c Clock, deadline time.Time) (context.Con
 	return dc, func() { dc.end(context.Canceled) }
 }
 
+// WithDeadlineCause is like context.WithDeadlineCause on c: when the deadline
+// passes, Err reports context.DeadlineExceeded and context.Cause reports cause.
+func WithDeadlineCause(ctx context.Context, c Clock, deadline time.Time, cause error) (context.Context, context.CancelFunc) {
+	if _, ok := c.(realClock); ok {
+		return context.WithDeadlineCause(ctx, deadline, cause)
+	}
+	// The cancel-cause context below carries the cause for context.Cause, which
+	// finds it through Value; the clock context on top reports the deadline error.
+	inner, cancelCause := context.WithCancelCause(ctx)
+	dc := &deadlineCtx{parent: inner, deadline: deadline, done: make(chan struct{})}
+	expire := func() {
+		cancelCause(cause)
+		dc.end(context.DeadlineExceeded)
+	}
+	if err := ctx.Err(); err != nil {
+		cancelCause(nil)
+		dc.end(err)
+		return dc, func() {}
+	}
+	d := deadline.Sub(c.Now())
+	if d <= 0 {
+		expire()
+		return dc, func() {}
+	}
+	dc.mu.Lock()
+	dc.timer = c.AfterFunc(d, expire)
+	dc.stopParent = context.AfterFunc(ctx, func() { dc.end(ctx.Err()) })
+	dc.mu.Unlock()
+	return dc, func() {
+		cancelCause(nil)
+		dc.end(context.Canceled)
+	}
+}
+
+// WithTimeoutCause returns WithDeadlineCause(ctx, c, c.Now().Add(d), cause).
+func WithTimeoutCause(ctx context.Context, c Clock, d time.Duration, cause error) (context.Context, context.CancelFunc) {
+	return WithDeadlineCause(ctx, c, c.Now().Add(d), cause)
+}
+
 // WithTimeout returns WithDeadline(ctx, c, c.Now().Add(d)).
 func WithTimeout(ctx context.Context, c Clock, d time.Duration) (context.Context, context.CancelFunc) {
 	return WithDeadline(ctx, c, c.Now().Add(d))
