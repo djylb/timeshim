@@ -2,6 +2,8 @@ package timeshim
 
 import (
 	"context"
+	"math"
+	"math/big"
 	"sync"
 	"time"
 )
@@ -25,7 +27,7 @@ func Until(c Clock, t time.Time) time.Duration {
 // Sleep waits until d has passed on c and returns nil, or ctx's error if ctx
 // ends first. A d of zero or less returns at once, with ctx's error if any.
 func Sleep(ctx context.Context, c Clock, d time.Duration) error {
-	if d <= 0 {
+	if d <= 0 || ctx.Err() != nil {
 		return ctx.Err()
 	}
 	t := NewTimer(c, d)
@@ -55,65 +57,68 @@ type ChanTimer struct {
 	fake *chanState
 }
 
-// chanState is the channel and AfterFunc timer behind a ChanTimer or Ticker
-// of a clock other than Real. gen counts Stop and Reset calls, so that a
-// send of a timer that fired before one of them is dropped.
+// chanState owns a non-Real timer's channel and registration. gen changes
+// when a callback is replaced or stopped, invalidating its pending sends.
 type chanState struct {
-	mu     sync.Mutex
-	c      chan time.Time
-	gen    uint64
-	queued bool // a send waits for the end of an Advance
-	clock  Clock
-	timer  Timer
-	period time.Duration // for a Ticker; 0 for a ChanTimer
+	mu        sync.Mutex
+	c         chan time.Time
+	gen       uint64
+	last      time.Time
+	at        time.Time // current target on a wrapped clock
+	delivered bool
+	pending   bool // armed or awaiting channel delivery
+	clock     Clock
+	timer     Timer
+	period    time.Duration // for a Ticker; 0 for a ChanTimer
 }
 
 func newChanState(c Clock, d, period time.Duration) *chanState {
-	s := &chanState{c: make(chan time.Time, 1), clock: c, period: period}
-	s.mu.Lock()
-	s.arm(d)
-	s.mu.Unlock()
+	s := &chanState{c: make(chan time.Time, 1), clock: c}
+	s.rearm(max(d, 0), period)
 	return s
 }
 
-// arm makes the current generation fire after d; s.mu is held. A timer
-// (not a Ticker) with d <= 0 has its value ready at once, as with
-// time.NewTimer: there is no function to run, so nothing waits for an
-// Advance.
-func (s *chanState) arm(d time.Duration) {
-	if d <= 0 && s.period == 0 {
-		s.timer = nil
-		s.sendLocked(s.clock.Now())
+// nextTick keeps the original phase even when the elapsed duration saturates.
+func nextTick(at, now time.Time, period time.Duration) (time.Time, bool) {
+	elapsed := now.Sub(at)
+	rem := elapsed % period
+	if elapsed == math.MaxInt64 {
+		// Unix seconds can wrap once across the full time.Time range.
+		delta := new(big.Int).Sub(big.NewInt(now.Unix()), big.NewInt(at.Unix()))
+		if delta.Sign() < 0 {
+			const wordBits = 64
+			delta.Add(delta, new(big.Int).Lsh(big.NewInt(1), wordBits))
+		}
+		delta.Mul(delta, big.NewInt(int64(time.Second)))
+		delta.Add(delta, big.NewInt(int64(now.Nanosecond()-at.Nanosecond())))
+		rem = time.Duration(delta.Mod(delta, big.NewInt(int64(period))).Int64())
+	}
+	return addTime(now, period-rem)
+}
+
+// A wrapped clock uses one underlying timer across positive resets. A callback
+// already in flight at Reset may run alongside the next one. Only the first
+// callback at or after the current target may deliver that target.
+func (s *chanState) fire(gen uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.gen != gen || !s.pending {
 		return
 	}
-	s.timer = s.clock.AfterFunc(d, s.fire(s.gen))
-}
-
-// fire returns the function of the timer of generation gen.
-func (s *chanState) fire(gen uint64) func() {
-	return func() {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if s.gen != gen {
+	now := s.clock.Now()
+	if now.Before(s.at) {
+		return
+	}
+	s.sendLocked(s.at)
+	if s.period > 0 {
+		if next, ok := nextTick(s.at, now, s.period); ok {
+			s.timer.Reset(next.Sub(now))
+			s.at, s.pending = next, true
 			return
 		}
-		now := s.clock.Now()
-		if f, ok := s.clock.(sendDeferrer); ok {
-			s.queued = true
-			f.deferSend(func() { s.send(gen, now) })
-		} else {
-			s.sendLocked(now)
-		}
-		if s.period > 0 {
-			s.timer.Reset(s.period)
-		}
 	}
-}
-
-// sendDeferrer is a clock that makes channel sends at the end of its
-// Advance: Fake, also embedded in another clock.
-type sendDeferrer interface {
-	deferSend(send func())
+	// A late callback can have delivered a target whose callback is still armed.
+	s.timer.Stop()
 }
 
 // send makes the send of generation gen that a Fake deferred.
@@ -123,41 +128,80 @@ func (s *chanState) send(gen uint64, now time.Time) {
 	if s.gen != gen {
 		return
 	}
-	s.queued = false
+
+	if s.delivered && !now.After(s.last) {
+		return
+	}
 	s.sendLocked(now)
+	s.delivered, s.last = true, now
 }
 
 // sendLocked sends now unless a value waits; s.mu is held.
 func (s *chanState) sendLocked(now time.Time) {
+	s.pending = false
 	select {
 	case s.c <- now:
 	default: // a Ticker drops the tick a slow receiver missed
 	}
 }
 
-// rearm stops the timer, drains the channel and, when d > 0, arms it again.
+// rearm replaces or stops the registration and drains any unread value.
+// A zero delay delivers immediately, and a negative delay stops the timer.
 func (s *chanState) rearm(d time.Duration, period time.Duration) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.gen++
-	pending := s.timer != nil && s.timer.Stop() || s.queued
-	s.timer, s.queued = nil, false
+	pending := s.pending
+	var now time.Time
+	switch {
+	case d > 0:
+		s.arm(d, period)
+	case d == 0:
+		now = s.clock.Now()
+		fallthrough
+	default:
+		if s.timer != nil {
+			s.timer.Stop()
+		}
+		s.gen++
+		s.timer = nil
+	}
+	s.pending, s.period, s.delivered = d > 0, period, false
 	select {
 	case <-s.c: // fired but not received: pending, as for time.Timer
 		pending = true
 	default:
 	}
-	if d > 0 || period == 0 && d >= 0 {
-		s.period = period
-		s.arm(d)
+	if d == 0 {
+		s.sendLocked(now)
 	}
 	return pending
+}
+
+// arm replaces a registration while s.mu is held. A direct Fake replaces
+// the callback as well, so deliveries owned by earlier advances stay stale.
+func (s *chanState) arm(d, period time.Duration) {
+	if c, ok := s.clock.(*Fake); ok {
+		gen := s.gen + 1
+		t := &fakeTimer{c: c, period: period, deferred: true, fire: func(at time.Time) { s.send(gen, at) }}
+		old, _ := s.timer.(*fakeTimer)
+		t.schedule(d, old)
+		s.timer, s.gen = t, gen
+		return
+	}
+	at := later(s.clock.Now(), d)
+	if s.timer == nil {
+		gen := s.gen
+		s.timer = s.clock.AfterFunc(d, func() { s.fire(gen) })
+	} else {
+		s.timer.Reset(d)
+	}
+	s.at = at
 }
 
 // NewTimer returns a timer that sends on its channel once d has passed on
 // c, as time.NewTimer. On Real it is a *time.Timer underneath. On other
 // clocks a d of zero or less has the value ready on C at once, as does
-// Reset with such a d.
+// Reset with such a d. A positive d with an unrepresentable target panics.
 func NewTimer(c Clock, d time.Duration) *ChanTimer {
 	if _, ok := c.(realClock); ok {
 		t := time.NewTimer(d)
@@ -177,7 +221,8 @@ func (t *ChanTimer) Stop() bool {
 }
 
 // Reset makes the timer fire d from now and reports whether it was
-// pending, as (*time.Timer).Reset.
+// pending, as (*time.Timer).Reset. On a Fake an unrepresentable target
+// panics and preserves the previous registration and any unread value.
 func (t *ChanTimer) Reset(d time.Duration) bool {
 	if t.real != nil {
 		return t.real.Reset(d)
@@ -196,7 +241,9 @@ type Ticker struct {
 }
 
 // NewTicker returns a ticker of period d on c, as time.NewTicker; d must be
-// positive.
+// positive. On clocks other than Real an unrepresentable first tick panics.
+// A Fake ticker retires after its last representable tick.
+// Stop tickers on clocks other than Real to release the clock registration.
 func NewTicker(c Clock, d time.Duration) *Ticker {
 	if d <= 0 {
 		panic("timeshim: non-positive interval for NewTicker")
@@ -215,11 +262,14 @@ func (t *Ticker) Stop() {
 		t.real.Stop()
 		return
 	}
-	t.fake.rearm(-1, 0)
+	if t.fake != nil {
+		t.fake.rearm(-1, 0)
+	}
 }
 
 // Reset stops the ticker and restarts it with period d, as
-// (*time.Ticker).Reset; d must be positive.
+// (*time.Ticker).Reset; d must be positive. On a Fake an unrepresentable
+// first tick panics and leaves the ticker unchanged.
 func (t *Ticker) Reset(d time.Duration) {
 	if d <= 0 {
 		panic("timeshim: non-positive interval for Ticker.Reset")
@@ -235,28 +285,16 @@ func (t *Ticker) Reset(d time.Duration) {
 // context.DeadlineExceeded once c reaches deadline, as context.WithDeadline
 // on the system clock. On a Fake the context ends within the Advance that
 // reaches deadline. A ctx that has ended, or a deadline that has passed,
-// gives a context that has ended already, with ctx's error first. It also ends when ctx does, or when the returned cancel
-// is called; children made by the context package propagate without a
-// goroutine of their own.
+// gives a context that has ended already, with ctx's error first. The supplied
+// clock drives the requested deadline even when ctx uses another clock.
+// The context also ends when ctx does, or when the returned cancel
+// is called. A parent with a private Done channel may require a waiting
+// goroutine unless it implements AfterFunc.
 func WithDeadline(ctx context.Context, c Clock, deadline time.Time) (context.Context, context.CancelFunc) {
 	if _, ok := c.(realClock); ok {
 		return context.WithDeadline(ctx, deadline)
 	}
-	dc := &deadlineCtx{parent: ctx, deadline: deadline, done: make(chan struct{})}
-	if err := ctx.Err(); err != nil {
-		dc.end(err)
-		return dc, func() {}
-	}
-	d := deadline.Sub(c.Now())
-	if d <= 0 {
-		dc.end(context.DeadlineExceeded)
-		return dc, func() {}
-	}
-	dc.mu.Lock()
-	dc.timer = c.AfterFunc(d, func() { dc.end(context.DeadlineExceeded) })
-	dc.stopParent = context.AfterFunc(ctx, func() { dc.end(ctx.Err()) })
-	dc.mu.Unlock()
-	return dc, func() { dc.end(context.Canceled) }
+	return WithDeadlineCause(ctx, c, deadline, nil)
 }
 
 // WithDeadlineCause is like context.WithDeadlineCause on c: when the deadline
@@ -265,118 +303,242 @@ func WithDeadlineCause(ctx context.Context, c Clock, deadline time.Time, cause e
 	if _, ok := c.(realClock); ok {
 		return context.WithDeadlineCause(ctx, deadline, cause)
 	}
-	// The cancel-cause context below carries the cause for context.Cause, which
-	// finds it through Value; the clock context on top reports the deadline error.
-	inner, cancelCause := context.WithCancelCause(ctx)
-	dc := &deadlineCtx{parent: inner, deadline: deadline, done: make(chan struct{})}
-	expire := func() {
-		cancelCause(cause)
-		dc.end(context.DeadlineExceeded)
+	inner, cancelCause := context.WithCancelCause(context.WithoutCancel(ctx))
+	dc := &deadlineCtx{clockContext: clockContext{inner}, deadline: deadline, done: make(chan struct{}), cancelCause: cancelCause}
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		dc.deadline = d
 	}
-	if err := ctx.Err(); err != nil {
-		cancelCause(nil)
-		dc.end(err)
-		return dc, func() {}
+	// Publish through a standard cancelable context. Its descendants, including
+	// those behind WithValue and WithCancel, then see the same Err and Cause
+	// synchronously when the clock fires.
+	child, release := context.WithCancel(dc)
+	end := func(err, cause error) {
+		if parentErr := ctx.Err(); parentErr != nil {
+			err, cause = parentErr, context.Cause(ctx)
+		}
+		dc.end(err, cause)
+		release()
 	}
-	d := deadline.Sub(c.Now())
-	if d <= 0 {
-		expire()
-		return dc, func() {}
-	}
-	dc.mu.Lock()
-	dc.timer = c.AfterFunc(d, expire)
-	dc.stopParent = context.AfterFunc(ctx, func() { dc.end(ctx.Err()) })
-	dc.mu.Unlock()
-	return dc, func() {
-		cancelCause(nil)
-		dc.end(context.Canceled)
-	}
+	cancel := func() { end(context.Canceled, nil) }
+	expire := func() { end(context.DeadlineExceeded, cause) }
+
+	dc.arm(ctx, c, deadline, expire, cancel)
+	return clockContext{child}, cancel
 }
 
-// WithTimeoutCause returns WithDeadlineCause(ctx, c, c.Now().Add(d), cause).
+// clockContext preserves the AfterFunc hook and the standard child's Done
+// channel, so value wrappers also participate in standard cancellation.
+type clockContext struct {
+	context.Context //nolint:containedctx // a context wrapper that exposes the AfterFunc hook
+}
+
+func (c clockContext) AfterFunc(f func()) func() bool { return context.AfterFunc(c.Context, f) }
+
+// WithTimeoutCause is like WithDeadlineCause with a deadline d from now.
+// On clocks other than Real it panics if that time cannot be represented.
 func WithTimeoutCause(ctx context.Context, c Clock, d time.Duration, cause error) (context.Context, context.CancelFunc) {
-	return WithDeadlineCause(ctx, c, c.Now().Add(d), cause)
+	if _, ok := c.(realClock); ok {
+		return context.WithTimeoutCause(ctx, d, cause)
+	}
+	return WithDeadlineCause(ctx, c, later(c.Now(), d), cause)
 }
 
-// WithTimeout returns WithDeadline(ctx, c, c.Now().Add(d)).
+// WithTimeout is like WithDeadline with a deadline d from now.
+// On clocks other than Real it panics if that time cannot be represented.
 func WithTimeout(ctx context.Context, c Clock, d time.Duration) (context.Context, context.CancelFunc) {
-	return WithDeadline(ctx, c, c.Now().Add(d))
+	if _, ok := c.(realClock); ok {
+		return context.WithTimeout(ctx, d)
+	}
+	return WithDeadline(ctx, c, later(c.Now(), d))
 }
 
 // deadlineCtx is a context that ends at a deadline of a clock other than
 // Real.
 type deadlineCtx struct {
-	parent   context.Context //nolint:containedctx // a context whose deadline follows a clock; the parent is what it wraps
-	deadline time.Time
-	done     chan struct{}
+	clockContext // carries the parent values and the published cancellation cause
+	deadline     time.Time
+	done         chan struct{}
 
-	mu         sync.Mutex
-	err        error
-	timer      Timer
-	stopParent func() bool
-	funcs      map[*func()]struct{} // of AfterFunc, until the end
+	mu          sync.Mutex
+	cancelCause context.CancelCauseFunc
+	err         error
+	parentWatch deadlineRegistration
+	alarm       *deadlineRegistration
+	propagate   func()
+	children    map[*parentWatch]struct{}
 }
 
-// end ends the context with err unless it has ended; it calls no user code
-// under the lock.
-func (c *deadlineCtx) end(err error) {
-	c.mu.Lock()
-	if c.err != nil {
-		c.mu.Unlock()
+type deadlineKey struct{}
+
+type parentWatch struct {
+	done   <-chan struct{}
+	notify func() // protected by the enclosing deadline's mutex
+}
+
+// Each segment has its own slot: its callback can run, renew, or cancel
+// before the clock returns the Timer from AfterFunc.
+type deadlineRegistration struct{ stop func() }
+
+// install either retains a new registration or releases it if cancellation
+// or another segment overtook it. External clock methods run without dc.mu.
+func (dc *deadlineCtx) install(slot *deadlineRegistration, stop func()) {
+	dc.mu.Lock()
+	if dc.err == nil && (slot == &dc.parentWatch || slot == dc.alarm) {
+		slot.stop = stop
+		stop = nil
+	}
+	dc.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
+}
+
+// arm uses the same failure cleanup on construction and on every renewal.
+// Relative clocks need another segment when the remaining duration saturates.
+func (dc *deadlineCtx) arm(ctx context.Context, c Clock, at time.Time, expire, cancel func()) {
+	if ctx.Err() != nil {
+		cancel()
 		return
 	}
-	c.err = err
-	close(c.done)
-	timer, stop, funcs := c.timer, c.stopParent, c.funcs
-	c.timer, c.stopParent, c.funcs = nil, nil, nil
-	c.mu.Unlock()
+	dc.mu.Lock()
+	if dc.err != nil {
+		dc.mu.Unlock()
+		return
+	}
+	first := dc.alarm == nil
+	slot := new(deadlineRegistration)
+	dc.alarm = slot
+	dc.mu.Unlock()
+
+	complete := false
+	defer func() {
+		if !complete {
+			cancel()
+		}
+	}()
+	if first {
+		dc.install(&dc.parentWatch, watchParent(ctx, cancel))
+	}
+	var timer Timer
+	if fake, ok := c.(*Fake); ok {
+		timer = fake.deadlineTimer(at, expire)
+	} else if left := at.Sub(c.Now()); left > 0 {
+		timer = c.AfterFunc(left, func() { dc.arm(ctx, c, at, expire, cancel) })
+	}
 	if timer != nil {
-		timer.Stop()
+		dc.install(slot, func() { timer.Stop() })
+	}
+	if timer == nil || ctx.Err() != nil {
+		expire()
+	}
+	complete = true
+}
+
+// watchParent follows independent cancellation of the immediate parent. When
+// an enclosing clock deadline ends, it also checks the immediate parent
+// synchronously, after standard contexts have propagated through any wrappers.
+func watchParent(parent context.Context, cancel func()) func() {
+	done := parent.Done()
+	if done == nil {
+		return nil
+	}
+	ancestor, _ := parent.Value(deadlineKey{}).(*deadlineCtx)
+	if ancestor == nil {
+		stop := context.AfterFunc(parent, cancel)
+		return func() { stop() }
+	}
+	w := &parentWatch{done: done, notify: cancel}
+	stop := context.AfterFunc(parent, func() {
+		ancestor.mu.Lock()
+		notify := w.notify
+		ancestor.mu.Unlock()
+		if notify != nil {
+			notify()
+		}
+	})
+	ancestor.mu.Lock()
+	if ancestor.err == nil {
+		if ancestor.children == nil {
+			ancestor.children = make(map[*parentWatch]struct{})
+		}
+		ancestor.children[w] = struct{}{}
+	}
+	ancestor.mu.Unlock()
+	return func() {
+		stop()
+		ancestor.mu.Lock()
+		delete(ancestor.children, w)
+		ancestor.mu.Unlock()
+	}
+}
+
+// takeChildren claims notifications for parents closed by standard
+// propagation. A detached or independently cancelable parent that is still
+// live keeps its ordinary AfterFunc subscription. dc.mu is held.
+func (dc *deadlineCtx) takeChildren() []func() {
+	var notify []func()
+	for w := range dc.children {
+		select {
+		case <-w.done:
+			notify = append(notify, w.notify)
+			w.notify = nil
+		default:
+		}
+	}
+	dc.children = nil
+	return notify
+}
+
+// end publishes the first result before calling external cleanup functions.
+func (dc *deadlineCtx) end(err, cause error) {
+	dc.mu.Lock()
+	if dc.err != nil {
+		dc.mu.Unlock()
+		return
+	}
+	if cause == nil {
+		cause = err
+	}
+	dc.err = err
+	dc.cancelCause(cause)
+	close(dc.done)
+	dc.propagate()
+	timer, stop, children := dc.alarm, dc.parentWatch.stop, dc.takeChildren()
+	dc.alarm, dc.parentWatch.stop, dc.propagate = nil, nil, nil
+	dc.mu.Unlock()
+	for _, check := range children {
+		check()
+	}
+	if timer != nil && timer.stop != nil {
+		timer.stop()
 	}
 	if stop != nil {
 		stop()
 	}
-	for f := range funcs {
-		go (*f)()
+}
+
+func (dc *deadlineCtx) Deadline() (time.Time, bool) { return dc.deadline, true }
+func (dc *deadlineCtx) Done() <-chan struct{}       { return dc.done }
+
+func (dc *deadlineCtx) Err() error {
+	select {
+	case <-dc.done:
+		return dc.err
+	default:
+		return nil
 	}
 }
 
-func (c *deadlineCtx) Deadline() (time.Time, bool) {
-	if d, ok := c.parent.Deadline(); ok && d.Before(c.deadline) {
-		return d, true
+func (dc *deadlineCtx) Value(key any) any {
+	if key == (deadlineKey{}) {
+		return dc
 	}
-	return c.deadline, true
+	return dc.clockContext.Value(key)
 }
 
-func (c *deadlineCtx) Done() <-chan struct{} { return c.done }
-
-func (c *deadlineCtx) Err() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.err
-}
-
-func (c *deadlineCtx) Value(key any) any { return c.parent.Value(key) }
-
-// AfterFunc lets the context package propagate the end of c to its
-// children without a goroutine each, as context.AfterFunc does.
-func (c *deadlineCtx) AfterFunc(f func()) func() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.err != nil {
-		go f()
-		return func() bool { return false }
-	}
-	if c.funcs == nil {
-		c.funcs = make(map[*func()]struct{})
-	}
-	p := &f
-	c.funcs[p] = struct{}{}
-	return func() bool {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		_, ok := c.funcs[p]
-		delete(c.funcs, p)
-		return ok
-	}
+// AfterFunc is the propagation hook for the single standard child created
+// during construction. Only that child is exposed to callers.
+func (dc *deadlineCtx) AfterFunc(f func()) func() bool {
+	dc.propagate = f
+	return func() bool { return false }
 }

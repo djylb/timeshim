@@ -17,15 +17,27 @@ func TestStandardLibraryOnly(t *testing.T) {
 	if err != nil {
 		t.Skip("no go command")
 	}
-	const module = "github.com/djylb/timeshim"
-	out, err := exec.CommandContext(t.Context(), goCmd, "list", "-deps", "-test", "-f", "{{.ImportPath}} {{.Standard}}", module+"/...").Output()
+	const format = "{{if not .Standard}}{{.ImportPath}}\t{{with .Module}}{{.Main}}\t{{.Path}}{{end}}{{end}}"
+	out, err := exec.CommandContext(t.Context(), goCmd, "list", "-deps", "-test", "-f", format, "./...").Output()
 	if err != nil {
 		t.Fatalf("go list: %v", err)
 	}
 	for line := range strings.Lines(string(out)) {
-		path, std, _ := strings.Cut(strings.TrimSpace(line), " ")
-		if std != "true" && path != module && !strings.HasPrefix(path, module+"/") && !strings.HasPrefix(path, module+".") && !strings.HasPrefix(path, module+"_") {
+		path, owner, ok := strings.Cut(strings.TrimSpace(line), "\t")
+		if path != "" && (!ok || !ownModule(owner)) {
 			t.Errorf("dependency outside the standard library: %s", path)
+		}
+	}
+}
+
+const modulePath = "github.com/djylb/timeshim"
+
+func ownModule(owner string) bool { return owner == "true\t"+modulePath }
+
+func TestSimilarModuleNames(t *testing.T) {
+	for _, suffix := range []string{"_extra", ".other", "/nested"} {
+		if ownModule("true\t" + modulePath + suffix) {
+			t.Error(suffix)
 		}
 	}
 }

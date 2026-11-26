@@ -19,6 +19,7 @@ jobs:
       matrix:
         os: [ ubuntu-latest, macos-latest, windows-latest ]
         go: [ go.mod, stable ]
+    timeout-minutes: 15
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -32,7 +33,7 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
           cache: false
-      - run: go test -race -count=1 ./...
+      - run: go test -timeout=5m -race -count=1 ./...
 
   cross-vet:
     runs-on: ubuntu-latest
@@ -59,7 +60,7 @@ jobs:
           do
             export GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0
             echo "::group::$target"
-            { go vet ./... && go test -c -o /dev/null ./...; } || failed+=("$target")
+            { go vet ./... && go test -timeout=30s -c -o /dev/null ./...; } || failed+=("$target")
             echo "::endgroup::"
           done
           if [ ${#failed[@]} -gt 0 ]; then
@@ -79,6 +80,7 @@ jobs:
       - run: CGO_ENABLED=1 GOOS=ios GOARCH=arm64 go vet ./...
 
   js-wasm-test:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -88,7 +90,7 @@ jobs:
           cache: false
       - name: go test on js/wasm under node
         # cross-vet only builds the tests; this runs them on the fake js network stack.
-        run: PATH="$PATH:$(go env GOROOT)/lib/wasm" GOOS=js GOARCH=wasm go test -count=1 ./...
+        run: PATH="$PATH:$(go env GOROOT)/lib/wasm" GOOS=js GOARCH=wasm go test -timeout=30s -count=1 ./...
 
   gofmt:
     runs-on: ubuntu-latest

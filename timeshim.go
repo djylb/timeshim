@@ -30,9 +30,9 @@ type Timer interface {
 }
 
 // Real is the system clock.
-var Real Clock = realClock{} //nolint:gochecknoglobals // exported default clock, stateless
+const Real realClock = 0
 
-type realClock struct{}
+type realClock int
 
 func (realClock) Now() time.Time                            { return time.Now() }
 func (realClock) AfterFunc(d time.Duration, f func()) Timer { return time.AfterFunc(d, f) }
@@ -45,14 +45,13 @@ func Or(c Clock) Clock {
 	return c
 }
 
-// Fake is a clock that moves only by Advance. Its zero value is not
-// ready; use NewFake. It is safe for concurrent use.
+// Fake is a clock that moves only by Advance. Its zero value starts at the zero time.
+// It is safe for concurrent use and must not be copied after first use.
 type Fake struct {
 	mu     sync.Mutex
 	now    time.Time
 	timers []*fakeTimer
 	armed  chan struct{} // closed when a timer is armed; nil if none waits
-	sends  []func()      // channel sends of the running Advance, made at its end
 }
 
 // NewFake returns a Fake clock at t.
@@ -69,15 +68,37 @@ func (c *Fake) Now() time.Time {
 // now, in the goroutine of Advance. A d of zero or less is due at once: f
 // is called by the next Advance, AdvanceTo or AdvanceToNext, Advance(0)
 // included, rather than in a goroutine of its own as time.AfterFunc does,
-// so that tests stay deterministic and f never runs under the caller's
-// locks.
+// so that tests stay deterministic and f never runs under the Fake's lock.
 //
-// Timer.Reset re-arms in the same way; a negative d counts as zero, so
-// Deadlines never reports a time before Now.
+// Timer.Reset re-arms in the same way. A negative d counts as zero, so
+// Deadlines never reports a time before Now. An unrepresentable target
+// panics before the registration changes.
 func (c *Fake) AfterFunc(d time.Duration, f func()) Timer {
+	t := &fakeTimer{c: c, fire: func(time.Time) { f() }}
+	t.schedule(d, nil)
+	return t
+}
+
+func later(now time.Time, d time.Duration) time.Time {
+	at, ok := addTime(now, d)
+	if !ok {
+		panic("timeshim: time out of range")
+	}
+	return at
+}
+
+func addTime(now time.Time, d time.Duration) (time.Time, bool) {
+	at := now.Add(d)
+	return at, at.Sub(now) == d
+}
+
+func (c *Fake) deadlineTimer(at time.Time, f func()) Timer {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	t := &fakeTimer{c: c, f: f, at: c.now.Add(max(d, 0))}
+	if !at.After(c.now) {
+		return nil
+	}
+	t := &fakeTimer{c: c, at: at, fire: func(time.Time) { f() }}
 	c.arm(t)
 	return t
 }
@@ -85,12 +106,12 @@ func (c *Fake) AfterFunc(d time.Duration, f func()) Timer {
 // Advance moves the clock d forward and calls, in order of their times and
 // outside the clock's lock, the functions that are due; a function may set
 // new timers, which are called too when due. The channels of a ChanTimer
-// or Ticker that fires receive its time when Advance ends, so that a
-// goroutine woken by one finds the clock at its new time, as after a jump,
+// or Ticker created directly on c receive the scheduled time when Advance
+// ends, so a goroutine woken by one finds the clock at its new time,
 // and no timer it sets fires in the same Advance. Functions due at the same time
 // are called in the order they were armed by AfterFunc or Reset. Time never
-// goes back: a negative d panics, and of concurrent calls, each leaves the
-// clock at least where it took it.
+// goes back. A negative d or an unrepresentable target panics. Of concurrent
+// calls, each leaves the clock at least where it took it.
 //
 // The order holds within one call. Concurrent calls take due functions
 // from the same list, so their functions may run at the same time in
@@ -100,9 +121,7 @@ func (c *Fake) Advance(d time.Duration) {
 	if d < 0 {
 		panic("timeshim: negative Advance")
 	}
-	c.mu.Lock()
-	end := c.now.Add(d)
-	c.mu.Unlock()
+	end := later(c.Now(), d)
 	c.run(end)
 }
 
@@ -114,14 +133,10 @@ func (c *Fake) AdvanceTo(t time.Time) { c.run(t) }
 // functions due then as Advance does, and returns that time. It reports
 // false, and leaves the clock alone, when no function is pending.
 func (c *Fake) AdvanceToNext() (time.Time, bool) {
-	c.mu.Lock()
-	i := c.next(time.Time{}, false)
-	if i < 0 {
-		c.mu.Unlock()
-		return time.Time{}, false
+	at, ok := c.Next()
+	if !ok {
+		return at, false
 	}
-	at := c.timers[i].at
-	c.mu.Unlock()
 	c.run(at)
 	return at, true
 }
@@ -131,7 +146,7 @@ func (c *Fake) AdvanceToNext() (time.Time, bool) {
 func (c *Fake) Next() (time.Time, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	i := c.next(time.Time{}, false)
+	i := c.next(nil)
 	if i < 0 {
 		return time.Time{}, false
 	}
@@ -152,37 +167,68 @@ func (c *Fake) Deadlines() []time.Time {
 
 // run calls the functions due by end and leaves the clock at least at end.
 func (c *Fake) run(end time.Time) {
+	var sends []func()
+	defer func() {
+		for _, send := range sends {
+			send()
+		}
+	}()
+	// A repeating timer contributes at most one delivery to this advance.
+	seen := make(map[*fakeTimer]bool)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.now.After(end) {
+		end = c.now
+	}
 	for {
-		c.mu.Lock()
-		i := c.next(end, true)
-		if i < 0 {
-			if end.After(c.now) {
-				c.now = end
-			}
-			sends := c.sends
-			c.sends = nil
-			c.mu.Unlock()
-			for _, send := range sends {
-				send()
-			}
+		t, at := c.step(end, seen)
+		if t == nil {
 			return
 		}
-		t := c.timers[i]
-		c.timers = slices.Delete(c.timers, i, i+1)
-		if t.at.After(c.now) {
-			c.now = t.at
+		if t.deferred {
+			sends = append(sends, func() { t.fire(at) })
+			continue
 		}
-		c.mu.Unlock()
-		t.f()
+		func() {
+			c.mu.Unlock()
+			defer c.mu.Lock()
+			t.fire(at)
+		}()
 	}
 }
 
-// next returns the index of the earliest timer, the first armed of equal
-// times, that is not after end when bounded, or -1; the lock is held.
-func (c *Fake) next(end time.Time, bounded bool) int {
+// step moves to the next observable event while holding the clock lock.
+func (c *Fake) step(end time.Time, seen map[*fakeTimer]bool) (*fakeTimer, time.Time) {
+	var due *fakeTimer
+	target := end
+	if i := c.next(seen); i >= 0 && !c.timers[i].at.After(end) {
+		due = c.timers[i]
+		target = due.at
+		c.timers = slices.Delete(c.timers, i, i+1)
+	}
+	if target.After(c.now) {
+		c.now = target
+	}
+	if len(seen) > 0 {
+		c.timers = slices.DeleteFunc(c.timers, func(t *fakeTimer) bool {
+			if !seen[t] || t.at.After(c.now) {
+				return false
+			}
+			c.notify()
+			return !t.repeat(c.now)
+		})
+	}
+	if due != nil && due.period > 0 && due.repeat(c.now) {
+		c.arm(due)
+		seen[due] = true
+	}
+	return due, target
+}
+
+func (c *Fake) next(skip map[*fakeTimer]bool) int {
 	i := -1
 	for j, t := range c.timers {
-		if (!bounded || !t.at.After(end)) && (i < 0 || t.at.Before(c.timers[i].at)) {
+		if !skip[t] && (i < 0 || t.at.Before(c.timers[i].at)) {
 			i = j
 		}
 	}
@@ -201,23 +247,7 @@ func (c *Fake) Pending() int {
 // and returns nil, or ctx's error if ctx ends first. It does not move the
 // clock.
 func (c *Fake) WaitPending(ctx context.Context, n int) error {
-	for {
-		c.mu.Lock()
-		if len(c.timers) >= n {
-			c.mu.Unlock()
-			return nil
-		}
-		if c.armed == nil {
-			c.armed = make(chan struct{})
-		}
-		armed := c.armed
-		c.mu.Unlock()
-		select {
-		case <-armed:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
+	return c.wait(ctx, func() bool { return len(c.timers) >= n })
 }
 
 // WaitDeadline waits until a function is pending at exactly t, such as
@@ -226,9 +256,13 @@ func (c *Fake) WaitPending(ctx context.Context, n int) error {
 // does not depend on how many other timers are pending. It does not move
 // the clock.
 func (c *Fake) WaitDeadline(ctx context.Context, t time.Time) error {
+	return c.wait(ctx, func() bool { return slices.ContainsFunc(c.timers, func(x *fakeTimer) bool { return x.at.Equal(t) }) })
+}
+
+func (c *Fake) wait(ctx context.Context, ready func() bool) error {
 	for {
 		c.mu.Lock()
-		if slices.ContainsFunc(c.timers, func(x *fakeTimer) bool { return x.at.Equal(t) }) {
+		if ready() {
 			c.mu.Unlock()
 			return nil
 		}
@@ -245,18 +279,14 @@ func (c *Fake) WaitDeadline(ctx context.Context, t time.Time) error {
 	}
 }
 
-// deferSend makes send, the channel send of a timer or ticker that has
-// fired, at the end of the running Advance.
-func (c *Fake) deferSend(send func()) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.sends = append(c.sends, send)
-}
-
 // arm adds t to the clock's list and wakes WaitPending; the clock's lock is
 // held.
 func (c *Fake) arm(t *fakeTimer) {
 	c.timers = append(c.timers, t)
+	c.notify()
+}
+
+func (c *Fake) notify() {
 	if c.armed != nil {
 		close(c.armed)
 		c.armed = nil
@@ -264,9 +294,20 @@ func (c *Fake) arm(t *fakeTimer) {
 }
 
 type fakeTimer struct {
-	c  *Fake
-	f  func()
-	at time.Time
+	c        *Fake
+	fire     func(time.Time)
+	deferred bool
+	period   time.Duration
+	at       time.Time
+}
+
+// repeat retires the ticker when its next tick cannot be represented.
+func (t *fakeTimer) repeat(now time.Time) bool {
+	at, ok := nextTick(t.at, now, t.period)
+	if ok {
+		t.at = at
+	}
+	return ok
 }
 
 func (t *fakeTimer) Stop() bool {
@@ -276,10 +317,16 @@ func (t *fakeTimer) Stop() bool {
 }
 
 func (t *fakeTimer) Reset(d time.Duration) bool {
+	return t.schedule(d, t)
+}
+
+// schedule validates the target and replaces old in one queue operation.
+func (t *fakeTimer) schedule(d time.Duration, old *fakeTimer) bool {
 	t.c.mu.Lock()
 	defer t.c.mu.Unlock()
-	pending := t.remove()
-	t.at = t.c.now.Add(max(d, 0))
+	at := later(t.c.now, max(d, 0))
+	pending := old != nil && old.remove()
+	t.at = at
 	t.c.arm(t)
 	return pending
 }

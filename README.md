@@ -23,7 +23,8 @@ func (c *Cache) expireAfter(d time.Duration, f func()) timeshim.Timer {
 }
 ```
 
-A `*time.Timer` is a `timeshim.Timer`, so `Real` adds no wrapper.
+A `*time.Timer` is a `timeshim.Timer`, so `Real` adds no wrapper. To switch clock implementations, declare
+`var clk timeshim.Clock = timeshim.Real`.
 
 ## API
 
@@ -41,10 +42,16 @@ functions that take a clock, with the names and semantics of `time`:
 | `WithDeadline`, `WithTimeout`   | `context.WithDeadline`, `WithTimeout`  |
 | `WithDeadlineCause`, `WithTimeoutCause` | `context.WithDeadlineCause`, `WithTimeoutCause` |
 
-On `Real` each of them calls the `time` or `context` function directly.
-On other clocks, timers and tickers are built on `AfterFunc` without a
-goroutine of their own, and contexts end in the `Advance` that reaches
-their deadline.
+On `Real` these helpers use system timers and contexts directly.
+`Sleep` waits on a stoppable timer so cancellation can wake it.
+On other clocks, stop tickers when finished to release their registrations.
+Only a direct `*Fake` defers channel delivery until an advance ends.
+Wrappers, including types embedding `*Fake`, use their own `Now` and
+`AfterFunc` methods and deliver the scheduled time when the callback runs.
+Standard cancelable parents and parents implementing
+`AfterFunc` support cancellation propagation without a waiting goroutine.
+For other parents with a private `Done` channel, the context package may
+start a waiter until the parent or child ends.
 
 ## Tests
 
@@ -76,8 +83,8 @@ clk.Advance(time.Minute)
 - `Advance` runs the functions that come due in its own goroutine, in order
   of their deadlines, outside the clock's lock, so a function may call the
   clock again or arm new timers; those run in the same `Advance` when due.
-- The channel of a `ChanTimer` or `Ticker` that fires in an `Advance`
-  receives the timer's time when that `Advance` ends: a goroutine it wakes
+- The channel of a `ChanTimer` or `Ticker` created directly on a `*Fake`
+  receives the timer's time when the firing `Advance` ends: a goroutine it wakes
   finds the clock at its new time, as after a jump, and a timer that
   goroutine sets does not fire in the same `Advance`, however it is
   scheduled.
@@ -90,7 +97,7 @@ clk.Advance(time.Minute)
   semantics of `time` since Go 1.23: a timer that fired but whose value was
   not received still counts as pending, after `Stop` or `Reset` returns no
   stale value is received, and a ticker drops ticks a slow receiver misses.
-- On a `Fake`, a delay of zero or less is due at once: the function runs in
+- For `Fake.AfterFunc` and its timer's `Reset`, a nonpositive delay is due at once: the function runs in
   the next `Advance` (`Advance(0)` included), not in a goroutine of its own,
   and `Deadlines` never reports a time before `Now`. A `ChanTimer` (or
   `After`) with such a delay has its value ready at once, as with
@@ -99,8 +106,20 @@ clk.Advance(time.Minute)
   due functions at the same time in different goroutines.
 - `WithDeadline` on an ended parent, or with a past deadline, returns a
   context that has already ended, with the parent's error first.
-- `Fake` is safe for concurrent use; its zero value is not ready, use
-  `NewFake`.
+- A clock drives the deadline requested on it. When a parent deadline fires,
+  its children inherit its error and cause, including through standard value
+  and cancellation contexts. An independent clock can still reach a child's
+  own requested deadline first. A parent wrapped in `context.WithoutCancel`
+  supplies values without propagating cancellation.
+- The zero value of `Fake` starts at the zero time. It supports concurrent
+  use and must not be copied after first use.
+- Each advance processes its own deferred deliveries even if a callback panics.
+  Older ticks overtaken by a later delivery are dropped. The panic propagates
+  with the clock at the latest time reached, including by nested advances.
+- On a fake clock, an unrepresentable target for relative advance, timeout,
+  initial timer or ticker registration, or reset panics. A failed reset preserves
+  the previous registration and any unread value. A running ticker retires
+  after its last representable tick.
 
 ## With testing/synctest
 

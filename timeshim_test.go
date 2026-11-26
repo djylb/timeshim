@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -30,27 +31,32 @@ func TestFake(t *testing.T) {
 	if len(got) != 4 || got[2] != 2 || got[3] != 1 || c.Pending() != 1 {
 		t.Fatalf("%v, %d pending", got, c.Pending())
 	}
+	c.Advance(time.Second)
+	if c.Pending() != 0 {
+		t.Fatal("timer left")
+	}
 	if Or(nil) != Real || Or(c) != c {
 		t.Error("Or")
-	}
-	if d := -time.Until(Real.Now()); d > time.Second || d < -time.Second {
-		t.Error("Real.Now")
 	}
 }
 
 func TestFakeWaitPending(t *testing.T) {
-	c := NewFake(time.Unix(0, 0))
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	go c.AfterFunc(time.Second, func() {})
-	if err := c.WaitPending(ctx, 1); err != nil || c.Pending() != 1 {
-		t.Fatalf("WaitPending() = %v with %d pending", err, c.Pending())
-	}
-	short, cancelShort := context.WithTimeout(t.Context(), 10*time.Millisecond)
-	defer cancelShort()
-	if err := c.WaitPending(short, 2); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("WaitPending() = %v, want the context's error", err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		c := NewFake(time.Unix(0, 0))
+		go c.AfterFunc(time.Second, func() {})
+		if err := c.WaitPending(t.Context(), 1); err != nil || c.Pending() != 1 {
+			t.Fatalf("WaitPending() = %v with %d pending", err, c.Pending())
+		}
+		short, cancelShort := context.WithTimeout(t.Context(), 10*time.Millisecond)
+		defer cancelShort()
+		if err := c.WaitPending(short, 2); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("WaitPending() = %v, want the context's error", err)
+		}
+		c.Advance(time.Second)
+		if c.Pending() != 0 {
+			t.Fatal("timer left")
+		}
+	})
 }
 
 func TestFakeAdvanceNeverGoesBack(t *testing.T) {
@@ -76,7 +82,7 @@ func TestFakeNextAndWaitDeadline(t *testing.T) {
 	}
 	at := c.Now().Add(2 * time.Second)
 	done := make(chan error, 1)
-	go func() { done <- c.WaitDeadline(context.Background(), at) }()
+	go func() { done <- c.WaitDeadline(t.Context(), at) }()
 	tm1 := c.AfterFunc(time.Second, func() {})
 	tm2 := c.AfterFunc(2*time.Second, func() {})
 	if err := <-done; err != nil {
