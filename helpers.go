@@ -384,6 +384,8 @@ type deadlineRegistration struct{ stop func() }
 func (dc *deadlineCtx) install(slot *deadlineRegistration, stop func()) {
 	dc.mu.Lock()
 	if dc.err == nil && (slot == &dc.parentWatch || slot == dc.alarm) {
+		// arm passes the address of parentWatch or a newly allocated alarm slot.
+		//goland:noinspection GoMaybeNil
 		slot.stop = stop
 		stop = nil
 	}

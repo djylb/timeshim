@@ -919,25 +919,27 @@ func TestParentDeadlineInFlight(t *testing.T) {
 func TestDeadlineThroughStandardContexts(t *testing.T) {
 	type key struct{}
 	for _, step := range []time.Duration{1, 100} {
-		var f Fake
-		root, stop := WithTimeoutCause(t.Context(), &f, 1, errParentGone)
-		defer stop()
-		value := context.WithValue(root, key{}, "value")
-		middle, stopMiddle := context.WithCancel(value)
-		defer stopMiddle()
-		viaValue, cancelValue := WithTimeoutCause(value, &f, 100, errQueueTimeout)
-		defer cancelValue()
-		viaCancel, cancelMiddle := WithTimeoutCause(middle, &f, 100, errQueueTimeout)
-		defer cancelMiddle()
-		f.Advance(step)
-		for _, child := range []context.Context{viaValue, viaCancel} {
-			if !errors.Is(child.Err(), context.DeadlineExceeded) || !errors.Is(context.Cause(child), errParentGone) || child.Value(key{}) != "value" {
-				t.Fatalf("after step %v: err %v, cause %v", step, child.Err(), context.Cause(child))
+		t.Run(step.String(), func(t *testing.T) {
+			var f Fake
+			root, stop := WithTimeoutCause(t.Context(), &f, 1, errParentGone)
+			defer stop()
+			value := context.WithValue(root, key{}, "value")
+			middle, stopMiddle := context.WithCancel(value)
+			defer stopMiddle()
+			viaValue, cancelValue := WithTimeoutCause(value, &f, 100, errQueueTimeout)
+			defer cancelValue()
+			viaCancel, cancelMiddle := WithTimeoutCause(middle, &f, 100, errQueueTimeout)
+			defer cancelMiddle()
+			f.Advance(step)
+			for _, child := range []context.Context{viaValue, viaCancel} {
+				if !errors.Is(child.Err(), context.DeadlineExceeded) || !errors.Is(context.Cause(child), errParentGone) || child.Value(key{}) != "value" {
+					t.Fatalf("err %v, cause %v", child.Err(), context.Cause(child))
+				}
 			}
-		}
-		if f.Pending() != 0 {
-			t.Fatal("child registrations survived parent deadline")
-		}
+			if f.Pending() != 0 {
+				t.Fatal("child registrations survived parent deadline")
+			}
+		})
 	}
 }
 
