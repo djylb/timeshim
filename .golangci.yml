@@ -39,13 +39,23 @@ linters:
       enable-all: true
     exhaustive:
       default-signifies-exhaustive: true
+    tagliatelle:
+      case:
+        overrides:
+          # Persisted state uses snake-case JSON keys.
+          - pkg: wallclock
+            rules:
+              json: snake
     nolintlint:
       require-explanation: true
       require-specific: true
   exclusions:
     rules:
-      # Fieldalignment checks struct size. For pointer-byte reports,
-      # fields keep their order of meaning.
+      # Public structs keep their fields in semantic order.
+      - linters:
+          - govet
+        text: '^fieldalignment: \p{Lu}[\p{L}\p{N}_]* has '
+      # For pointer-byte reports, fields keep their order of meaning.
       - linters:
           - govet
         text: '^fieldalignment: .+ has [0-9]+ leading bytes of pointer data but optimal value is [0-9]+$'

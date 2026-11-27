@@ -1,9 +1,15 @@
 # timeshim
 
-Injectable time for deterministic tests. Code that times out or expires in
-the background takes a `timeshim.Clock` instead of calling `time.Now` and
-`time.AfterFunc`; production uses the system clock, and tests move a fake
-clock instead of waiting. Standard library only.
+Injectable clocks for timers, deadlines, and wall time. Production can use
+the system clock, and tests can advance a fake clock explicitly. Requires
+Go 1.26 and uses only the standard library.
+
+| Package | Contents |
+| --- | --- |
+| `github.com/djylb/timeshim` | Clock interface, real and fake clocks, timers, tickers, and context deadlines |
+| `github.com/djylb/timeshim/wallclock` | Wall time estimated from trusted observations, with lower bounds and restorable state |
+
+## Install
 
 ```sh
 go get github.com/djylb/timeshim
@@ -52,6 +58,46 @@ Standard cancelable parents and parents implementing
 `AfterFunc` support cancellation propagation without a waiting goroutine.
 For other parents with a private `Done` channel, the context package may
 start a waiter until the parent or child ends.
+
+## Corrected wall time
+
+Use a `wallclock.Clock` when the system wall clock may be unset or
+inaccurate. The zero value and `New(nil, 0)` use the system clock as the
+base. Pass a `timeshim.Fake` as the base in tests.
+
+```go
+import (
+	"time"
+
+	"github.com/djylb/timeshim/wallclock"
+)
+
+func correctedNow(knownPast, observed time.Time) time.Time {
+	clk := wallclock.New(nil, 0)
+	clk.Raise(knownPast.Unix())
+	clk.Observe(observed.Unix())
+	return clk.Now()
+}
+```
+
+- Validate the source before calling `Observe` or `Raise`. The clock
+  computes the median of up to five recent observations and carries the
+  observations and lower bounds forward using elapsed time on the base
+  clock. `New` accepts an initial lower bound used until an offset is
+  available, while a bound recorded by `Raise` continues to apply.
+- `Now` returns wall time and may step after a correction. Use `Local`
+  or the base clock to measure elapsed time. `AfterFunc` delegates to
+  the base clock, so a correction leaves an armed timer's delay intact.
+- Store the snapshot from `State` and pass it to `Restore` at startup.
+  The caller owns serialization and storage. `OnSample` registers a
+  synchronous callback that runs outside the clock's lock. Concurrent
+  observations can run callbacks concurrently, so serialize snapshot
+  and write together if your store needs ordered updates.
+- Obtain `Changes` before computing a wall-clock deadline. A correction
+  closes the channel and lets waiters recompute the deadline. Get a new
+  channel after each close. The clock starts no background work. Call
+  `Stop` on timers you no longer need and use your own cancellation when
+  waiting on `Changes`.
 
 ## Tests
 
