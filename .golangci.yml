@@ -51,10 +51,6 @@ linters:
       require-specific: true
   exclusions:
     rules:
-      # Public structs keep their fields in semantic order.
-      - linters:
-          - govet
-        text: '^fieldalignment: \p{Lu}[\p{L}\p{N}_]* has '
       # For pointer-byte reports, fields keep their order of meaning.
       - linters:
           - govet
