@@ -329,7 +329,7 @@ func WithDeadlineCause(ctx context.Context, c Clock, deadline time.Time, cause e
 // clockContext preserves the AfterFunc hook and the standard child's Done
 // channel, so value wrappers also participate in standard cancellation.
 type clockContext struct {
-	context.Context //nolint:containedctx // a context wrapper that exposes the AfterFunc hook
+	context.Context //nolint:containedctx // Embedding preserves the wrapped context's methods while adding the AfterFunc hook.
 }
 
 func (c clockContext) AfterFunc(f func()) func() bool { return context.AfterFunc(c.Context, f) }
@@ -384,7 +384,7 @@ type deadlineRegistration struct{ stop func() }
 func (dc *deadlineCtx) install(slot *deadlineRegistration, stop func()) {
 	dc.mu.Lock()
 	if dc.err == nil && (slot == &dc.parentWatch || slot == dc.alarm) {
-		// arm passes the address of parentWatch or a newly allocated alarm slot.
+		// arm passes only the address of parentWatch or a newly allocated slot, both non-nil.
 		//goland:noinspection GoMaybeNil
 		slot.stop = stop
 		stop = nil
